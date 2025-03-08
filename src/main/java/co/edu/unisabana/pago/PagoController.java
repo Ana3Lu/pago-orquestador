@@ -21,8 +21,8 @@ public class PagoController {
     @PostMapping("/notificar")
     public ResponseEntity<String> enviarNotificacion(@RequestParam String proveedor) {
         String url = proveedor.equalsIgnoreCase("aldeamo")
-                ? "http://localhost:8081/notificación"
-                : "http://localhost:8082/notificación";
+                ? "http://localhost:8081/notificacion"
+                : "http://localhost:8082/notificacion";
 
         String response = webClient.post()
                 .uri(url)
