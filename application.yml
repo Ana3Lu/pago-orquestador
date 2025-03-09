@@ -1,7 +1,0 @@
-resilience4j.circuitbreaker:
-  instances:
-    notificacionCircuitBreaker:
-      failureRateThreshold: 50
-      waitDurationInOpenState: 10s
-      permittedNumberOfCallsInHalfOpenState: 2
-      slidingWindowSize: 10

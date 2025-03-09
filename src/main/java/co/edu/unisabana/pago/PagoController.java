@@ -1,15 +1,21 @@
 package co.edu.unisabana.pago;
 
-import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Mono;
 
-import java.io.FileWriter;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 @Slf4j
 @RestController
@@ -18,43 +24,64 @@ public class PagoController {
 
     private final WebClient webClient;
     private static final String LOG_FILE = "registro_notificaciones.txt";
+    private final CircuitBreaker circuitBreaker;
 
-    public PagoController(WebClient.Builder webClientBuilder) {
+    public PagoController(WebClient.Builder webClientBuilder, CircuitBreakerRegistry circuitBreakerRegistry) {
         this.webClient = webClientBuilder.build();
+        this.circuitBreaker = circuitBreakerRegistry.circuitBreaker("notificacionCircuitBreaker");
     }
 
-    @CircuitBreaker(name = "notificacionCircuitBreaker", fallbackMethod = "fallbackNotificacion")
     @PostMapping("/notificar")
-    public ResponseEntity<String> enviarNotificacion() {
-        return enviarNotificacionAProveedor("aldeamo"); // Siempre intenta Aldeamo primero
+    public CompletableFuture<ResponseEntity<String>> enviarNotificacion() {
+        return intentarEnvio("Aldeamo")
+                .onErrorResume(e -> {
+                    log.warn("Circuit Breaker activado. Intentando con Twilio...");
+                    return fallbackNotificacion();
+                })
+                .toFuture()
+                .exceptionally(e -> {
+                    log.error("Todos los proveedores fallaron. Error: {}", e.getMessage());
+                    return ResponseEntity.status(500).body("Todos los proveedores fallaron");
+                });
     }
 
-    private ResponseEntity<String> enviarNotificacionAProveedor(String proveedor) {
-        String url = proveedor.equalsIgnoreCase("aldeamo")
-                ? "http://localhost:8081/notificacion"
-                : "http://localhost:8082/notificacion";
+    private Mono<ResponseEntity<String>> intentarEnvio(String proveedor) {
+        String url = "http://localhost:" + (proveedor.equalsIgnoreCase("aldeamo") ? "8081" : "8082") + "/notificacion";
 
-        String response = webClient.post()
+        log.info("Enviando notificación a: {}", proveedor);
+
+        return webClient.post()
                 .uri(url)
                 .retrieve()
                 .bodyToMono(String.class)
-                .block();
-
-        // Guardar en archivo que se envió a este proveedor
-        registrarEnArchivo(proveedor);
-
-        return ResponseEntity.ok("Notificación enviada a " + proveedor);
+                .timeout(Duration.ofSeconds(5))
+                .map(response -> {
+                    log.info("Notificación enviada a: {}", proveedor);
+                    registrarEnArchivo(proveedor);
+                    return ResponseEntity.ok(proveedor); // 🔹 Solo devuelve el nombre del proveedor
+                })
+                .doOnError(e -> log.warn("Error con {}: {}", proveedor, e.getMessage()))
+                .onErrorResume(e -> {
+                    circuitBreaker.onError(Duration.ofSeconds(1).toMillis(), TimeUnit.MILLISECONDS, e);
+                    return Mono.error(new RuntimeException("Fallo en " + proveedor, e));
+                });
     }
-    public ResponseEntity<String> fallbackNotificacion(Throwable t) {
-        log.warn("Fallo Aldeamo, intentando Twilio...");
-        return enviarNotificacionAProveedor("twilio"); // Si Aldeamo falla, intenta Twilio
+
+    private Mono<ResponseEntity<String>> fallbackNotificacion() {
+        return intentarEnvio("Twilio")
+                .doOnError(e -> log.warn("Twilio también falló: {}", e.getMessage()))
+                .onErrorResume(e -> {
+                    log.error("Todos los proveedores fallaron. No se pudo enviar la notificación.");
+                    return Mono.just(ResponseEntity.status(500).body("Todos los proveedores fallaron"));
+                });
     }
 
     private void registrarEnArchivo(String proveedor) {
-        try (FileWriter writer = new FileWriter(LOG_FILE, true)) {
-            writer.write(LocalDateTime.now() + " - Notificación enviada a: " + proveedor + "\n");
+        try {
+            String mensaje = LocalDateTime.now() + " - Notificación enviada a: " + proveedor + "\n";
+            Files.write(Paths.get(LOG_FILE), mensaje.getBytes(), StandardOpenOption.CREATE, StandardOpenOption.APPEND);
         } catch (IOException e) {
-            log.error("Error escribiendo en el archivo de registro", e);
-        }
-    }
+            log.error("Error en el registro de notificación", e);
+        }
+    }
 }
